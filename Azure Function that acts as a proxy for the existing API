@@ -1,0 +1,86 @@
+const { CosmosClient } = require("@azure/cosmos");
+const { BlobServiceClient } = require("@azure/storage-blob");
+
+module.exports = async function (context, req) {
+    const recordId = req.query.id || (req.body && req.body.id);
+    
+    if (!recordId) {
+        context.res = {
+            status: 400,
+            body: "Please provide a billing record ID."
+        };
+        return;
+    }
+
+    context.log(`Request for record ID: ${recordId}`);
+
+    try {
+        // Configuration - Replace with your values
+        const cosmosConfig = {
+            endpoint: process.env["CosmosDB_Endpoint"],
+            key: process.env["CosmosDB_Key"],
+            databaseId: "billingDB",
+            containerId: "records"
+        };
+        
+        const blobConfig = {
+            connectionString: process.env["BlobStorage_ConnectionString"],
+            containerName: "archived-records"
+        };
+
+        // Initialize clients
+        const cosmosClient = new CosmosClient({
+            endpoint: cosmosConfig.endpoint,
+            key: cosmosConfig.key
+        });
+        
+        const blobServiceClient = BlobServiceClient.fromConnectionString(blobConfig.connectionString);
+        const containerClient = blobServiceClient.getContainerClient(blobConfig.containerName);
+
+        // Check Cosmos DB for the record
+        const { resource: record } = await cosmosClient.database(cosmosConfig.databaseId)
+            .container(cosmosConfig.containerId)
+            .item(recordId)
+            .read();
+
+        if (record) {
+            context.log(`Record found in Cosmos DB: ${recordId}`);
+            context.res = {
+                status: 200,
+                body: record
+            };
+        } else {
+            context.log(`Record not found in Cosmos DB, checking Blob Storage: ${recordId}`);
+            const blobName = `${recordId}.json`;
+            const blockBlobClient = containerClient.getBlockBlobClient(blobName);
+            const downloadBlockBlobResponse = await blockBlobClient.download(0);
+            const downloadedData = await streamToString(downloadBlockBlobResponse.readableStreamBody);
+
+            context.log(`Record retrieved from Blob Storage: ${recordId}`);
+            context.res = {
+                status: 200,
+                body: JSON.parse(downloadedData)
+            };
+        }
+    } catch (err) {
+        context.log.error(`Error retrieving record ${recordId}: ${err}`);
+        context.res = {
+            status: 500,
+            body: "An error occurred while retrieving the record."
+        };
+    }
+};
+
+// Helper function to convert stream to string
+async function streamToString(readableStream) {
+    const chunks = [];
+    return new Promise((resolve, reject) => {
+        readableStream.on("data", (chunk) => {
+            chunks.push(chunk);
+        });
+        readableStream.on("end", () => {
+            resolve(Buffer.concat(chunks).toString("utf8"));
+        });
+        readableStream.on("error", reject);
+    });
+}
