@@ -1,0 +1,209 @@
+Implementation (JavaScript)
+// Archiving function - index.js
+const { CosmosClient } = require("@azure/cosmos");
+const { BlobServiceClient } = require("@azure/storage-blob");
+
+module.exports = async function (context, myTimer) {
+    const timeStamp = new Date().toISOString();
+    context.log(`Archive function started at: ${timeStamp}`);
+
+    try {
+        // Configuration - Replace with your values
+        const cosmosConfig = {
+            endpoint: process.env["CosmosDB_Endpoint"],
+            key: process.env["CosmosDB_Key"],
+            databaseId: "billingDB",
+            containerId: "records"
+        };
+        
+        const blobConfig = {
+            connectionString: process.env["BlobStorage_ConnectionString"],
+            containerName: "archived-records"
+        };
+
+        // Three months ago date
+        const threeMonthsAgo = new Date();
+        threeMonthsAgo.setMonth(threeMonthsAgo.getMonth() - 3);
+        
+        // Initialize clients
+        const cosmosClient = new CosmosClient({
+            endpoint: cosmosConfig.endpoint,
+            key: cosmosConfig.key
+        });
+        
+        const blobServiceClient = BlobServiceClient.fromConnectionString(blobConfig.connectionString);
+        const containerClient = blobServiceClient.getContainerClient(blobConfig.containerName);
+
+        // Query Cosmos DB for old records
+        const query = `SELECT * FROM c WHERE c.timestamp <= "${threeMonthsAgo.toISOString()}"`;
+        
+        const { resources: docs } = await cosmosClient.database(cosmosConfig.databaseId)
+            .container(cosmosConfig.containerId)
+            .items.query(query)
+            .fetchAll();
+
+        context.log(`Found ${docs.length} documents to archive`);
+
+        // Process each document
+        let archivedCount = 0;
+        const promises = docs.map(async doc => {
+            try {
+                // Store in Blob Storage (using document ID as blob name)
+                const blobName = `${doc.id}.json`;
+                const blockBlobClient = containerClient.getBlockBlobClient(blobName);
+                
+                await blockBlobClient.upload(JSON.stringify(doc), JSON.stringify(doc).length);
+                
+                // Remove from Cosmos DB
+                await cosmosClient.database(cosmosConfig.databaseId)
+                    .container(cosmosConfig.containerId)
+                    .item(doc.id)
+                    .delete();
+
+                archivedCount++;
+                context.log(`Archived document ${doc.id}`);
+            } catch (err) {
+                context.log.error(`Error processing document ${doc.id}: ${err}`);
+            }
+        });
+
+        await Promise.all(promises);
+        context.log(`Successfully archived ${archivedCount} documents`);
+        
+    } catch (err) {
+        context.log.error(`Archive function failed: ${err}`);
+        throw err;
+    }
+};
+Function Configuration (function.json)
+{
+  "bindings": [
+    {
+      "name": "myTimer",
+      "type": "timerTrigger",
+      "direction": "in",
+      "schedule": "0 0 0 * * *"  // Runs daily at midnight UTC
+    }
+  ],
+  "scriptFile": "index.js"
+}
+Local Settings (local.settings.json)
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "node",
+    "CosmosDB_Endpoint": "your-cosmos-db-endpoint",
+    "CosmosDB_Key": "your-cosmos-db-key",
+    "BlobStorage_ConnectionString": "your-blob-storage-connection-string"
+  }
+}
+Alternative C# Implementation
+For teams preferring C#, here's the equivalent solution:
+// Archiving function - ArchiveFunction.cs
+using Microsoft.Azure.WebJobs;
+using Microsoft.Extensions.Logging;
+using Microsoft.Azure.Cosmos;
+using Azure.Storage.Blobs;
+using System;
+using System.Threading.Tasks;
+using System.Collections.Generic;
+
+public static class ArchiveFunction
+{
+    [FunctionName("ArchiveFunction")]
+    public static async Task Run(
+        [TimerTrigger("0 0 0 * * *")] TimerInfo myTimer,
+        ILogger log)
+    {
+        log.LogInformation($"Archive function started at: {DateTime.UtcNow}");
+
+        try
+        {
+            // Configuration
+            var cosmosConfig = new CosmosConfig
+            {
+                Endpoint = Environment.GetEnvironmentVariable("CosmosDB_Endpoint"),
+                Key = Environment.GetEnvironmentVariable("CosmosDB_Key"),
+                DatabaseId = "billingDB",
+                ContainerId = "records"
+            };
+            
+            var blobConfig = new BlobConfig
+            {
+                ConnectionString = Environment.GetEnvironmentVariable("BlobStorage_ConnectionString"),
+                ContainerName = "archived-records"
+            };
+
+            // Three months ago date
+            var threeMonthsAgo = DateTime.UtcNow.AddMonths(-3);
+
+            // Initialize clients
+            var cosmosClient = new CosmosClient(cosmosConfig.Endpoint, cosmosConfig.Key);
+            var blobServiceClient = new BlobServiceClient(blobConfig.ConnectionString);
+            var containerClient = blobServiceClient.GetBlobContainerClient(blobConfig.ContainerName);
+
+            // Query Cosmos DB
+            var query = new QueryDefinition(
+                $"SELECT * FROM c WHERE c.timestamp <= @threeMonthsAgo")
+                .WithParameter("@threeMonthsAgo", threeMonthsAgo);
+
+            var container = cosmosClient.GetContainer(cosmosConfig.DatabaseId, cosmosConfig.ContainerId);
+            var iterator = container.GetItemQueryIterator<dynamic>(query);
+            var docs = new List<dynamic>();
+            
+            while (iterator.HasMoreResults)
+            {
+                var response = await iterator.ReadNextAsync();
+                docs.AddRange(response.Resource);
+            }
+
+            log.LogInformation($"Found {docs.Count} documents to archive");
+
+            // Process each document
+            int archivedCount = 0;
+            foreach (var doc in docs)
+            {
+                try
+                {
+                    // Store in Blob Storage
+                    string blobName = $"{doc.id}.json";
+                    var blobClient = containerClient.GetBlobClient(blobName);
+                    
+                    await blobClient.UploadAsync(BinaryData.FromObjectAsJson(doc), overwrite: true);
+                    
+                    // Remove from Cosmos DB
+                    await container.DeleteItemAsync<dynamic>(doc.id.ToString(), new PartitionKey(doc.id.ToString()));
+                    
+                    archivedCount++;
+                    log.LogInformation($"Archived document {doc.id}");
+                }
+                catch (Exception ex)
+                {
+                    log.LogError($"Error processing document {doc.id}: {ex.Message}");
+                }
+            }
+
+            log.LogInformation($"Successfully archived {archivedCount} documents");
+        }
+        catch (Exception ex)
+        {
+            log.LogError($"Archive function failed: {ex}");
+            throw;
+        }
+    }
+}
+
+public class CosmosConfig
+{
+    public string Endpoint { get; set; }
+    public string Key { get; set; }
+    public string DatabaseId { get; set; }
+    public string ContainerId { get; set; }
+}
+
+public class BlobConfig
+{
+    public string ConnectionString { get; set; }
+    public string ContainerName { get; set; }
+}
