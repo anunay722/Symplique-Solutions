@@ -1,0 +1,75 @@
+const { CosmosClient } = require("@azure/cosmos");
+const { BlobServiceClient } = require("@azure/storage-blob");
+
+module.exports = async function (context, myTimer) {
+    const timeStamp = new Date().toISOString();
+    context.log(`Archive function started at: ${timeStamp}`);
+
+    try {
+        // Configuration - Replace with your values
+        const cosmosConfig = {
+            endpoint: process.env["CosmosDB_Endpoint"],
+            key: process.env["CosmosDB_Key"],
+            databaseId: "billingDB",
+            containerId: "records"
+        };
+        
+        const blobConfig = {
+            connectionString: process.env["BlobStorage_ConnectionString"],
+            containerName: "archived-records"
+        };
+
+        // Three months ago date
+        const threeMonthsAgo = new Date();
+        threeMonthsAgo.setMonth(threeMonthsAgo.getMonth() - 3);
+        
+        // Initialize clients
+        const cosmosClient = new CosmosClient({
+            endpoint: cosmosConfig.endpoint,
+            key: cosmosConfig.key
+        });
+        
+        const blobServiceClient = BlobServiceClient.fromConnectionString(blobConfig.connectionString);
+        const containerClient = blobServiceClient.getContainerClient(blobConfig.containerName);
+
+        // Query Cosmos DB for old records
+        const query = `SELECT * FROM c WHERE c.timestamp <= "${threeMonthsAgo.toISOString()}"`;
+        
+        const { resources: docs } = await cosmosClient.database(cosmosConfig.databaseId)
+            .container(cosmosConfig.containerId)
+            .items.query(query)
+            .fetchAll();
+
+        context.log(`Found ${docs.length} documents to archive`);
+
+        // Process each document
+        let archivedCount = 0;
+        const promises = docs.map(async doc => {
+            try {
+                // Store in Blob Storage (using document ID as blob name)
+                const blobName = `${doc.id}.json`;
+                const blockBlobClient = containerClient.getBlockBlobClient(blobName);
+                
+                await blockBlobClient.upload(JSON.stringify(doc), JSON.stringify(doc).length);
+                
+                // Remove from Cosmos DB
+                await cosmosClient.database(cosmosConfig.databaseId)
+                    .container(cosmosConfig.containerId)
+                    .item(doc.id)
+                    .delete();
+
+                archivedCount++;
+                context.log(`Archived document ${doc.id}`);
+            } catch (err) {
+                context.log.error(`Error processing document ${doc.id}: ${err}`);
+            }
+        });
+
+        await Promise.all(promises);
+        context.log(`Successfully archived ${archivedCount} documents`);
+        
+    } catch (err) {
+        context.log.error(`Archive function failed: ${err}`);
+        throw err;
+    }
+};
